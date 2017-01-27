@@ -1,0 +1,340 @@
+---
+title: "Topics in tweets of some Dutch politicians"
+subtitle: Topic modeling with quanteda and topic models
+output:
+  html_document:
+    number_sections: yes
+    toc: yes
+    toc_float: yes
+  html_notebook:
+    fig_caption: yes
+    number_sections: yes
+    toc: yes
+    toc_float: yes
+---
+
+```{r, initial_libs, include=FALSE}
+## include neccesary libraries
+library(lazyeval)
+library(quanteda)
+library(wordcloud)
+library(topicmodels)
+library(stringr)
+library(ggplot2)
+library(dplyr)
+library(textcat)
+library(DT)
+library(plotly)
+library(lubridate)
+```
+
+# Introduction 
+
+This document describes the creation of topics with the `quanteda` and `topicmodels` packages. The texts from which topics are extracted need to be in one column in a data frame. The following code gives a brief overview of the data. 
+
+## The data
+```{r, import_data}
+
+AllTweets = readRDS("AllTweets.Rds")
+dim(AllTweets)
+
+```
+
+The texts are tweets that are collected from a selected number of parlement members. They are listed in the following table.
+
+```{r, uniqueMembers }
+AllTweets$uur = hour(AllTweets$created)
+AllTweets %>% 
+  group_by(screenName,Partij) %>% summarise(ntweets=n()) %>%
+  DT::datatable(
+    options = list(
+      pageLength = 10, autoWidth = TRUE
+      ),
+    caption ="selected politicians"
+  )
+```
+
+## Some statistics
+
+Some interesting statistics are given by the following graphs. It turns out that politicians are just like ordinary humans, they are less productive in the summer and in weekends.
+
+```{r, tweetsperday}
+daily = AllTweets %>% 
+  filter(created > "2016-03-15") %>%
+  mutate(
+    dag = cut(created, breaks="days")
+  ) %>%
+  group_by(dag ) %>%
+  summarise(n=n())
+
+plot_ly(
+  daily, type = "bar",  x = ~dag,  y = ~n
+) %>%
+  layout(
+    xaxis = list( tickangle = 45),
+    title = "Number of tweets by the politicians per day", 
+    yaxis = list(title= "n")
+  ) 
+```
+
+***
+
+<br>
+
+```{r}
+
+ggplot(AllTweets, aes(uur, fill=Partij)) + 
+  geom_bar(aes(y = (..count..)/sum(..count..)),position="dodge") +
+  scale_y_continuous(labels = scales::percent) +
+  ylab("percentage tweets") +
+  ggtitle("tweets per hour over the day per party")
+
+```
+
+
+```{r, dayofweek}
+AllTweets %>% 
+  mutate(
+    dayofweek = lubridate::wday(created, label=TRUE)
+  ) %>%
+  group_by(dayofweek) %>%
+  summarise(n=n()) %>%
+  ggplot(aes(dayofweek)) +
+  geom_bar(aes(weight = n)) +
+  ggtitle("tweets per day of week")
+
+```
+
+## Clean tweets
+
+Clean texts in tweets, remove punctuations, https etc....
+
+```{r, clean_up}
+AllTweets = AllTweets %>% 
+  mutate(
+    clean_tweet = str_replace(text,"RT @[a-z,A-Z]*: ",""),
+    clean_tweet = str_replace_all(clean_tweet,  "https://t.co/[a-z,A-Z,0-9]*", ""),
+    clean_tweet =  str_replace_all(clean_tweet,"@[a-z,A-Z]*","")   
+  )
+```
+
+See the word length of the tweets
+
+```{r, word_length, fig.width=11}
+
+## woord lengte
+WordLength = str_match_all(
+  AllTweets$clean_tweet, 
+  '\\s+'
+)
+
+AllTweets$AantalWoorden = sapply(WordLength,length)
+ggplot(
+  data = AllTweets, 
+  aes(AantalWoorden)
+) + 
+  geom_histogram(
+    binwidth = 1, 
+    col="black"
+  ) + 
+  facet_grid(~Partij)
+```
+
+***
+
+<br>
+
+```{r}
+AllTweets %>% 
+  group_by(Partij) %>% 
+  summarise(
+    MedianWords = median(AantalWoorden),
+    AverageWords = mean(AantalWoorden)
+  )
+```
+
+
+## Creation of corpus
+
+For the analysis I have used only tweets with 5 or more words
+```{r, corpus_creation}
+
+## gebruik alleen commentaren met meer dan 5 woorden
+AllTweets_5 = filter(AllTweets, AantalWoorden >= 5)
+TweetCorp = corpus(AllTweets_5$clean_tweet)
+
+summary(TweetCorp, n=10)
+```
+
+## The term document matrix
+
+From the all the tweets we now create a term document matrix. First ignore certain words
+
+```{r, term_docu_matrix}
+
+StopWoorden =  c(
+  "amp", "nl", "via", "vd", "ga", "af", "onze", 
+  "vvd", "pvda", "cda", "sp", "sgp", "we", "and", "the", 
+  "to", "no", "with", "this", "http","t.co",
+  stopwords("english"),
+  stopwords("dutch"), 
+  letters
+)
+
+TweetCorpdfm = dfm(
+  TweetCorp,
+  ignoredFeatures = StopWoorden,
+  stem = FALSE,
+  ngrams = 1:2
+)
+```
+
+The dimension of the term document matrix is:
+```{r, dimension_dfm}
+dim(TweetCorpdfm)
+```
+
+The top 50 words occuring in the data are given by
+```{r, frequentWords}
+## nodig om later te kunnen koppelen
+AllTweets_5$textID = row.names(TweetCorpdfm)
+
+
+### top features / words
+topfeatures( TweetCorpdfm, n = 50)
+plot(
+  TweetCorpdfm, 
+  max.words = 200, 
+  scale=c(1.5,.25),
+  colors = brewer.pal(8, "Dark2")
+)
+
+```
+
+# Topics per political party
+
+Now apply latent dirichlet allocation (LDA) per political party. For each politcal party an LDA is performed.
+
+```{r, apply_LDA, message=FALSE, warning=FALSE, cache=TRUE}
+
+k = 4
+NTERMS = 30
+ResultsLDA = list()
+
+partijen = names(table(AllTweets_5$Partij))
+
+### reduce terms
+for(partij in partijen)
+{
+  
+  tweets_eenPartij = filter(AllTweets_5, Partij == partij)
+  TweetCorp = corpus(tweets_eenPartij$clean_tweet)
+  TweetCorpdfm = dfm(
+    TweetCorp,
+    ignoredFeatures = StopWoorden,
+    stem = FALSE,
+    ngrams = 1:2
+  )
+  TweetCorpdfm_reduced <- trim(TweetCorpdfm, minCount = 5, minDoc = 5)
+  print(dim(TweetCorpdfm_reduced))
+  ResultsLDA[[partij]] = LDA(convert(TweetCorpdfm_reduced, to = "topicmodels"), k = k)
+
+  
+}
+
+```
+
+Table of terms per topic per political party
+
+```{r, lda_per_party}
+
+ALLTOPICTERMS = NULL
+for(partij in partijen)
+{
+  TOPICTERMS = as.data.frame(get_terms( ResultsLDA[[partij]], NTERMS))
+  TOPICTERMS$Partij = partij
+  ALLTOPICTERMS = rbind(ALLTOPICTERMS, TOPICTERMS)
+}
+
+DT::datatable(
+  ALLTOPICTERMS, 
+  options = list(
+    pageLength = 30, autoWidth = TRUE
+  ),
+  caption = paste("Topics in tweets")
+)
+
+```
+
+## Word clouds
+
+Word cloud visualisations per politcal party
+
+```{r, wordcloud, message=FALSE, warning=FALSE}
+
+##### visualisatie wordclouds per topic ####
+for(partij in partijen)
+{
+  TweetTopics = ResultsLDA[[partij]]
+  png(paste0(partij,".png"),  width = 700, height = 700)
+  par(mfrow=c(2,2))
+  
+  for (i in 1:k)
+  {
+    Topic = i
+    TopN = 100
+  
+    TermProbsPerTopic = data.frame(
+      Term = TweetTopics@terms, 
+      TermProb = TweetTopics@beta[Topic,],
+      stringsAsFactors = FALSE
+    )
+    TermProbsPerTopic = arrange(TermProbsPerTopic, desc(TermProb)) [1:TopN,]
+  
+    pal = brewer.pal(9,"BuGn")
+    pal <- pal[-(1:4)]
+  
+   
+    wordcloud(
+      TermProbsPerTopic$Term,
+      scale=c(4,.15), 
+      exp(TermProbsPerTopic$TermProb)*1000,
+      color = pal,
+      min.freq = 1
+    )
+    title(paste("Topic:" ,i))
+  
+  }
+  
+  dev.off()
+}
+```
+
+## word cloud results
+
+The following figures are the results of the code above.
+
+### VVD Topics
+
+![](VVD.png)
+
+### CDA topics
+
+![](CDA.png)
+
+### SP topics
+
+![](SP.png)
+
+
+### SGP topics
+
+![](SGP.png)
+
+### Partij voor de dieren topics
+
+![](PARTIJvoorDIEREN.png)
+
+
+### PVV topics
+![](PVV.png)
